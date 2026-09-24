@@ -23,7 +23,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -40,6 +42,13 @@ def _dropped_image_path(event) -> Path | None:
         return None
     path = Path(event.mimeData().urls()[0].toLocalFile())
     return path if path.suffix.lower() in SUPPORTED_EXTENSIONS else None
+
+
+def _widen(spin: QDoubleSpinBox | QSpinBox) -> None:
+    """Donne aux champs numériques une largeur minimale confortable et les
+    laisse grandir avec le panneau (au lieu de rester à leur largeur mini)."""
+    spin.setMinimumWidth(70)
+    spin.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
 
 def pil_to_qpixmap(image: Image.Image) -> QPixmap:
@@ -100,7 +109,13 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
         central = QWidget()
-        layout = QHBoxLayout(central)
+        outer_layout = QHBoxLayout(central)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Un QSplitter (plutôt qu'un simple layout à largeur fixe) permet à
+        # l'utilisateur de faire glisser la séparation pour élargir le
+        # panneau de droite.
+        splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # --- Zone d'affichage (avec ascenseurs pour les grandes images) ---
         self.image_view = ImageView()
@@ -110,7 +125,7 @@ class MainWindow(QMainWindow):
         # il n'y a pas (encore) d'image, ce qui donne une vraie zone de
         # drop sur toute la surface plutôt que seulement 300x300 px.
         scroll.setWidgetResizable(True)
-        layout.addWidget(scroll, stretch=3)
+        splitter.addWidget(scroll)
 
         # --- Panneau de contrôle ---
         panel = QVBoxLayout()
@@ -122,9 +137,14 @@ class MainWindow(QMainWindow):
 
         panel_widget = QWidget()
         panel_widget.setLayout(panel)
-        panel_widget.setFixedWidth(300)
-        layout.addWidget(panel_widget, stretch=1)
+        panel_widget.setMinimumWidth(240)
+        splitter.addWidget(panel_widget)
 
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([800, 320])
+
+        outer_layout.addWidget(splitter)
         self.setCentralWidget(central)
 
     def _build_load_group(self) -> QGroupBox:
@@ -154,6 +174,7 @@ class MainWindow(QMainWindow):
         self.canvas_width_percent.setSingleStep(5.0)
         self.canvas_width_percent.setValue(100.0)
         self.canvas_width_percent.setSuffix(" %")
+        _widen(self.canvas_width_percent)
 
         self.canvas_height_percent = QDoubleSpinBox()
         self.canvas_height_percent.setRange(1.0, 1000.0)
@@ -161,6 +182,7 @@ class MainWindow(QMainWindow):
         self.canvas_height_percent.setSingleStep(5.0)
         self.canvas_height_percent.setValue(100.0)
         self.canvas_height_percent.setSuffix(" %")
+        _widen(self.canvas_height_percent)
 
         size_row.addWidget(QLabel("Largeur"))
         size_row.addWidget(self.canvas_width_percent)
@@ -190,6 +212,7 @@ class MainWindow(QMainWindow):
         self.mask_radius_spin = QSpinBox()
         self.mask_radius_spin.setRange(1, 20000)
         self.mask_radius_spin.setValue(150)
+        _widen(self.mask_radius_spin)
         radius_row.addWidget(QLabel("Rayon"))
         radius_row.addWidget(self.mask_radius_spin)
         layout.addLayout(radius_row)
@@ -198,6 +221,7 @@ class MainWindow(QMainWindow):
         self.mask_feather_spin = QSpinBox()
         self.mask_feather_spin.setRange(0, 2000)
         self.mask_feather_spin.setValue(40)
+        _widen(self.mask_feather_spin)
         feather_row.addWidget(QLabel("Fondu (px)"))
         feather_row.addWidget(self.mask_feather_spin)
         layout.addLayout(feather_row)
@@ -205,8 +229,10 @@ class MainWindow(QMainWindow):
         center_row = QHBoxLayout()
         self.mask_center_x_spin = QSpinBox()
         self.mask_center_x_spin.setRange(0, 20000)
+        _widen(self.mask_center_x_spin)
         self.mask_center_y_spin = QSpinBox()
         self.mask_center_y_spin.setRange(0, 20000)
+        _widen(self.mask_center_y_spin)
         center_row.addWidget(QLabel("Centre X"))
         center_row.addWidget(self.mask_center_x_spin)
         center_row.addWidget(QLabel("Centre Y"))
