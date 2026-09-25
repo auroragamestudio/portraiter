@@ -9,8 +9,17 @@ import sys
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QDragEnterEvent, QDragMoveEvent, QDropEvent, QImage, QPixmap
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QDragEnterEvent,
+    QDragMoveEvent,
+    QDropEvent,
+    QImage,
+    QKeyEvent,
+    QMouseEvent,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QColorDialog,
@@ -30,7 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from image_ops import apply_circular_fade_mask, resize_canvas
+from image_ops import apply_circular_fade_mask, composite_over_background, resize_canvas
 
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".webp"}
 
@@ -60,9 +69,16 @@ def pil_to_qpixmap(image: Image.Image) -> QPixmap:
 
 
 class ImageView(QLabel):
-    """Affiche l'image courante. Le drag-and-drop est géré par la fenêtre
-    principale (voir MainWindow) : un widget enfant sans acceptDrops laisse
-    l'événement remonter automatiquement jusqu'à elle."""
+    """Affiche l'image courante. Le drag-and-drop de fichier est géré par la
+    fenêtre principale (voir MainWindow) : un widget enfant sans acceptDrops
+    laisse l'événement remonter automatiquement jusqu'à elle.
+
+    Le clic-glisser à la souris, lui, sert à déplacer le centre du masque
+    circulaire en temps réel : on émet les coordonnées (dans l'espace de
+    l'image, pas du widget) à chaque clic/déplacement bouton gauche enfoncé.
+    """
+
+    mask_center_dragged = Signal(float, float)
 
     def __init__(self) -> None:
         super().__init__()
@@ -70,6 +86,44 @@ class ImageView(QLabel):
         self.setMinimumSize(300, 300)
         self.setStyleSheet("background-color: #3a3a3a; color: #cccccc;")
         self.setText("Glissez-déposez une image ici\nou utilisez « Charger une image… »")
+        self._dragging_mask = False
+
+    def _to_image_coords(self, pos) -> tuple[float, float] | None:
+        """Convertit une position (coordonnées du widget) en coordonnées
+        image, en tenant compte du centrage du pixmap dans le label. None si
+        aucune image n'est affichée ou si le point tombe hors de l'image."""
+        pixmap = self.pixmap()
+        if pixmap is None or pixmap.isNull():
+            return None
+        offset_x = (self.width() - pixmap.width()) / 2
+        offset_y = (self.height() - pixmap.height()) / 2
+        x = pos.x() - offset_x
+        y = pos.y() - offset_y
+        if 0 <= x <= pixmap.width() and 0 <= y <= pixmap.height():
+            return x, y
+        return None
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            coords = self._to_image_coords(event.position())
+            if coords is not None:
+                self._dragging_mask = True
+                self.mask_center_dragged.emit(*coords)
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._dragging_mask:
+            coords = self._to_image_coords(event.position())
+            if coords is not None:
+                self.mask_center_dragged.emit(*coords)
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging_mask = False
+        super().mouseReleaseEvent(event)
 
 
 class MainWindow(QMainWindow):
@@ -81,9 +135,26 @@ class MainWindow(QMainWindow):
         self.original_image: Image.Image | None = None
         self.working_image: Image.Image | None = None
         self.canvas_background = QColor(255, 255, 255, 255)  # blanc opaque par défaut
+        # Tant que True, la vue affiche working_image + le masque courant en
+        # direct, sans le "cuire" dans working_image (voir _current_preview_image).
+        self.mask_preview_enabled = False
 
         self.setAcceptDrops(True)
         self._build_ui()
+
+    # ---------------------------------------------------------- Clavier
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        # Numpad +/- : ajuste la largeur du fondu en direct. On vérifie
+        # KeypadModifier pour cibler spécifiquement le pavé numérique (et
+        # pas les touches +/- de la rangée principale).
+        if self.working_image is not None and event.modifiers() & Qt.KeyboardModifier.KeypadModifier:
+            if event.key() == Qt.Key.Key_Plus:
+                self.mask_feather_spin.stepUp()
+                return
+            if event.key() == Qt.Key.Key_Minus:
+                self.mask_feather_spin.stepDown()
+                return
+        super().keyPressEvent(event)
 
     # -------------------------------------------------------- Drag & drop
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
@@ -119,6 +190,7 @@ class MainWindow(QMainWindow):
 
         # --- Zone d'affichage (avec ascenseurs pour les grandes images) ---
         self.image_view = ImageView()
+        self.image_view.mask_center_dragged.connect(self._on_mask_dragged)
         scroll = QScrollArea()
         scroll.setWidget(self.image_view)
         # widgetResizable=True : le label occupe tout l'espace visible quand
@@ -221,6 +293,7 @@ class MainWindow(QMainWindow):
         self.mask_feather_spin = QSpinBox()
         self.mask_feather_spin.setRange(0, 2000)
         self.mask_feather_spin.setValue(40)
+        self.mask_feather_spin.setSingleStep(5)  # pas utilisé aussi par Numpad +/-
         _widen(self.mask_feather_spin)
         feather_row.addWidget(QLabel("Fondu (px)"))
         feather_row.addWidget(self.mask_feather_spin)
@@ -238,6 +311,16 @@ class MainWindow(QMainWindow):
         center_row.addWidget(QLabel("Centre Y"))
         center_row.addWidget(self.mask_center_y_spin)
         layout.addLayout(center_row)
+
+        # Aperçu en direct : tout changement d'un paramètre du masque
+        # (manuel, ou via le drag/Numpad) recalcule et réaffiche l'aperçu.
+        for spin in (
+            self.mask_radius_spin,
+            self.mask_feather_spin,
+            self.mask_center_x_spin,
+            self.mask_center_y_spin,
+        ):
+            spin.valueChanged.connect(self._on_mask_param_changed)
 
         center_btn = QPushButton("Centrer sur l'image")
         center_btn.clicked.connect(self._center_mask)
@@ -298,11 +381,21 @@ class MainWindow(QMainWindow):
         self.canvas_height_percent.blockSignals(False)
         self._update_canvas_preview()
 
+        self.mask_center_x_spin.blockSignals(True)
+        self.mask_center_y_spin.blockSignals(True)
+        self.mask_radius_spin.blockSignals(True)
         self.mask_center_x_spin.setRange(0, w)
         self.mask_center_y_spin.setRange(0, h)
         self.mask_center_x_spin.setValue(w // 2)
         self.mask_center_y_spin.setValue(h // 2)
         self.mask_radius_spin.setValue(min(w, h) // 3 or 1)
+        self.mask_center_x_spin.blockSignals(False)
+        self.mask_center_y_spin.blockSignals(False)
+        self.mask_radius_spin.blockSignals(False)
+        # Nouvelle image (ou réinitialisation) : le masque (couleurs/valeurs
+        # par défaut) est visible tout de suite, cohérent avec le fait que
+        # l'export l'inclut toujours lui aussi.
+        self.mask_preview_enabled = True
 
     def _target_canvas_size(self) -> tuple[int, int]:
         """Taille de canvas en pixels, calculée à partir des pourcentages
@@ -329,6 +422,7 @@ class MainWindow(QMainWindow):
         )
         if color.isValid():
             self.canvas_background = color
+            self._refresh_view()
 
     def _on_resize_canvas_clicked(self) -> None:
         if self.working_image is None:
@@ -349,16 +443,56 @@ class MainWindow(QMainWindow):
         self.mask_center_x_spin.setValue(w // 2)
         self.mask_center_y_spin.setValue(h // 2)
 
-    def _on_apply_mask_clicked(self) -> None:
+    def _on_mask_param_changed(self) -> None:
+        """Un paramètre du masque a changé (spinbox, ou via _on_mask_dragged) :
+        active l'aperçu en direct et rafraîchit la vue."""
         if self.working_image is None:
-            QMessageBox.information(self, "Aucune image", "Chargez d'abord une image.")
             return
-        self.working_image = apply_circular_fade_mask(
-            self.working_image,
+        self.mask_preview_enabled = True
+        self._refresh_view()
+
+    def _on_mask_dragged(self, x: float, y: float) -> None:
+        if self.working_image is None:
+            return
+        self.mask_center_x_spin.blockSignals(True)
+        self.mask_center_y_spin.blockSignals(True)
+        self.mask_center_x_spin.setValue(round(x))
+        self.mask_center_y_spin.setValue(round(y))
+        self.mask_center_x_spin.blockSignals(False)
+        self.mask_center_y_spin.blockSignals(False)
+        self._on_mask_param_changed()
+
+    def _masked_image(self, base: Image.Image) -> Image.Image:
+        """Applique le masque circulaire courant à `base`, puis colle le
+        résultat sur la couleur de fond du canvas (self.canvas_background,
+        toujours la valeur *actuelle*) au lieu de laisser une zone
+        transparente — un changement de couleur se répercute donc aussitôt."""
+        masked = apply_circular_fade_mask(
+            base,
             radius=self.mask_radius_spin.value(),
             feather=self.mask_feather_spin.value(),
             center=(self.mask_center_x_spin.value(), self.mask_center_y_spin.value()),
         )
+        bg = self.canvas_background
+        background = (bg.red(), bg.green(), bg.blue(), bg.alpha())
+        return composite_over_background(masked, background)
+
+    def _current_preview_image(self) -> Image.Image:
+        """Image à afficher : working_image tel quel, ou avec le masque
+        courant superposé en direct si l'aperçu est actif."""
+        assert self.working_image is not None
+        if not self.mask_preview_enabled:
+            return self.working_image
+        return self._masked_image(self.working_image)
+
+    def _on_apply_mask_clicked(self) -> None:
+        if self.working_image is None:
+            QMessageBox.information(self, "Aucune image", "Chargez d'abord une image.")
+            return
+        self.working_image = self._masked_image(self.working_image)
+        # Le masque vient d'être "cuit" dans working_image : on désactive
+        # l'aperçu pour ne pas l'appliquer une deuxième fois par-dessus.
+        self.mask_preview_enabled = False
         self._refresh_view()
 
     def _on_save_clicked(self) -> None:
@@ -373,7 +507,7 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        image_to_save = self.working_image
+        image_to_save = self._current_preview_image()
         if Path(path).suffix.lower() in {".jpg", ".jpeg", ".bmp"}:
             # Ces formats ne supportent pas la transparence.
             image_to_save = image_to_save.convert("RGB")
@@ -383,8 +517,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Erreur", f"Impossible d'enregistrer l'image :\n{exc}")
 
     def _refresh_view(self) -> None:
-        assert self.working_image is not None
-        self.image_view.setPixmap(pil_to_qpixmap(self.working_image))
+        if self.working_image is None:
+            return
+        self.image_view.setPixmap(pil_to_qpixmap(self._current_preview_image()))
         w, h = self.working_image.size
         self.dimensions_label.setText(f"Dimensions actuelles : {w} × {h} px")
 

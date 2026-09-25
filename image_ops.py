@@ -43,6 +43,12 @@ def resize_canvas(
     return canvas
 
 
+def _ease_out_sine(t: np.ndarray) -> np.ndarray:
+    """Easing « sine out » : monte vite au début puis ralentit en douceur
+    vers 1, plutôt qu'une progression linéaire."""
+    return np.sin(t * (np.pi / 2))
+
+
 def apply_circular_fade_mask(
     image: Image.Image,
     radius: float,
@@ -52,9 +58,10 @@ def apply_circular_fade_mask(
     """Retourne une copie de `image` masquée par un cercle.
 
     Les pixels situés à moins de `radius` du centre restent totalement
-    opaques. Au-delà, l'opacité diminue linéairement jusqu'à zéro sur une
-    distance de `feather` pixels ; au-delà de `radius + feather`, les
-    pixels sont entièrement transparents.
+    opaques. Au-delà, l'opacité diminue jusqu'à zéro sur une distance de
+    `feather` pixels en suivant une courbe d'easing sine-out (plutôt qu'un
+    dégradé linéaire) ; au-delà de `radius + feather`, les pixels sont
+    entièrement transparents.
     """
     image = image.convert("RGBA")
     width, height = image.size
@@ -63,8 +70,9 @@ def apply_circular_fade_mask(
 
     y, x = np.mgrid[0:height, 0:width]
     distance = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
-    fade = 1.0 - (distance - radius) / feather
-    mask = np.clip(fade, 0.0, 1.0)
+    # t = 0 pile au rayon (encore opaque), t = 1 à radius + feather (transparent).
+    t = np.clip((distance - radius) / feather, 0.0, 1.0)
+    mask = 1.0 - _ease_out_sine(t)
 
     alpha = np.asarray(image.getchannel("A"), dtype=np.float32) / 255.0
     combined_alpha = (alpha * mask * 255.0).astype(np.uint8)
@@ -72,3 +80,17 @@ def apply_circular_fade_mask(
     result = image.copy()
     result.putalpha(Image.fromarray(combined_alpha, mode="L"))
     return result
+
+
+def composite_over_background(
+    image: Image.Image,
+    background: tuple[int, int, int, int],
+) -> Image.Image:
+    """Colle `image` (avec transparence) sur un fond uni de la même taille.
+
+    Utilisé pour que les zones rendues transparentes par le masque circulaire
+    affichent la couleur de fond du canvas plutôt que de rester transparentes.
+    """
+    image = image.convert("RGBA")
+    canvas = Image.new("RGBA", image.size, background)
+    return Image.alpha_composite(canvas, image)
